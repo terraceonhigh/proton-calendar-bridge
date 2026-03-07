@@ -1,0 +1,24 @@
+[Unit]
+Description=Proton Calendar Bridge (CalDAV proxy at 127.0.0.1:9842)
+Documentation=https://github.com/terraceonhigh/proton-calendar-bridge
+After=network.target
+
+[Service]
+# The bridge binary must be installed at /usr/local/bin/proton-calendar-bridge
+# (or adjust ExecStart to the actual path).
+ExecStart=/usr/local/bin/proton-calendar-bridge
+Restart=on-failure
+RestartSec=5s
+# Provider: 'proton' for live Proton Calendar API, 'ics' for a read-only .ics URL.
+Environment=PCB_PROVIDER=proton
+# Listen address expected by GNOME Online Accounts (goa_proton_calendar_bridge_is_running
+# checks TCP port 9842).
+Environment=PCB_BIND_ADDRESS=127.0.0.1:9842
+# Local bearer token — CalDAV clients send this as the Basic-auth password.
+# Choose a random secret; it never leaves the local machine.
+Environment=PCB_BEARER_TOKEN=change-me
+# Your Proton key password (login password) — used to encrypt events on write.
+Environment=PCB_KEY_PASSWORD=change-me
+
+[Install]
+WantedBy=default.target
