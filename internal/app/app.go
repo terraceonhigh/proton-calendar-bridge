@@ -9,7 +9,7 @@ import (
 	"sync"
 
 	"github.com/sevenofnine/proton-calendar-bridge/internal/api"
-	"github.com/sevenofnine/proton-calendar-bridge/internal/auth"
+	authStore "github.com/sevenofnine/proton-calendar-bridge/internal/auth"
 	"github.com/sevenofnine/proton-calendar-bridge/internal/config"
 	"github.com/sevenofnine/proton-calendar-bridge/internal/protonapi"
 	"github.com/sevenofnine/proton-calendar-bridge/internal/provider"
@@ -18,10 +18,11 @@ import (
 )
 
 type Application struct {
-	cfg      config.Config
-	provider provider.CalendarProvider
-	tray     tray.App
-	logger   *slog.Logger
+	cfg           config.Config
+	provider      provider.CalendarProvider
+	authenticator api.Authenticator
+	tray          tray.App
+	logger        *slog.Logger
 }
 
 func New(cfg config.Config, p provider.CalendarProvider, tr tray.App, logger *slog.Logger) *Application {
@@ -34,19 +35,39 @@ func New(cfg config.Config, p provider.CalendarProvider, tr tray.App, logger *sl
 	return &Application{cfg: cfg, provider: p, tray: tr, logger: logger}
 }
 
+func (a *Application) SetAuthenticator(auth api.Authenticator) {
+	a.authenticator = auth
+}
+
+// BuildResult holds the provider and optional authenticator from BuildProvider.
+type BuildResult struct {
+	Provider      provider.CalendarProvider
+	Authenticator api.Authenticator
+}
+
 func BuildProvider(cfg config.Config) (provider.CalendarProvider, error) {
+	result, err := BuildProviderWithAuth(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return result.Provider, nil
+}
+
+func BuildProviderWithAuth(cfg config.Config) (BuildResult, error) {
 	providerType := strings.TrimSpace(cfg.ProviderType)
 	if providerType == "" {
 		providerType = strings.TrimSpace(cfg.Provider)
 	}
 	switch providerType {
 	case "ics":
-		return provider.NewICSProvider(cfg.ICSURL, nil), nil
+		return BuildResult{Provider: provider.NewICSProvider(cfg.ICSURL, nil)}, nil
 	case "proton":
 		client := protonapi.NewClient(protonapi.ClientOptions{})
-		return provider.NewProtonProvider(client, auth.Store{}), nil
+		prov := provider.NewProtonProvider(client, authStore.Store{})
+		authenticator := protonapi.NewAuthenticator(client)
+		return BuildResult{Provider: prov, Authenticator: authenticator}, nil
 	default:
-		return nil, fmt.Errorf("unsupported provider type: %s", providerType)
+		return BuildResult{}, fmt.Errorf("unsupported provider type: %s", providerType)
 	}
 }
 
@@ -57,7 +78,8 @@ func (a *Application) Run(ctx context.Context) error {
 			Enabled: a.cfg.RequireBearerToken,
 			Token:   a.cfg.BearerToken,
 		},
-		Logger: a.logger,
+		Authenticator: a.authenticator,
+		Logger:        a.logger,
 	})
 
 	ctx, cancel := context.WithCancel(ctx)

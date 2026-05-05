@@ -12,21 +12,30 @@ import (
 
 	"github.com/sevenofnine/proton-calendar-bridge/internal/caldav"
 	"github.com/sevenofnine/proton-calendar-bridge/internal/domain"
+	"github.com/sevenofnine/proton-calendar-bridge/internal/protonapi"
 	"github.com/sevenofnine/proton-calendar-bridge/internal/provider"
 	"github.com/sevenofnine/proton-calendar-bridge/internal/security"
 )
 
 type Server struct {
-	provider provider.CalendarProvider
-	auth     security.BearerAuth
-	log      *slog.Logger
-	httpSrv  *http.Server
+	provider      provider.CalendarProvider
+	auth          security.BearerAuth
+	authenticator Authenticator
+	log           *slog.Logger
+	httpSrv       *http.Server
+}
+
+// Authenticator handles Proton session login. Nil means auth endpoints are disabled.
+type Authenticator interface {
+	Login(ctx context.Context, username, password string) (protonapi.Auth, error)
+	Submit2FA(ctx context.Context, totpCode string) error
 }
 
 type Options struct {
-	Provider provider.CalendarProvider
-	Auth     security.BearerAuth
-	Logger   *slog.Logger
+	Provider      provider.CalendarProvider
+	Auth          security.BearerAuth
+	Authenticator Authenticator
+	Logger        *slog.Logger
 }
 
 func New(opts Options) *Server {
@@ -34,7 +43,7 @@ func New(opts Options) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	s := &Server{provider: opts.Provider, auth: opts.Auth, log: logger}
+	s := &Server{provider: opts.Provider, auth: opts.Auth, authenticator: opts.Authenticator, log: logger}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/v1/capabilities", s.handleCapabilities)
@@ -43,6 +52,8 @@ func New(opts Options) *Server {
 	mux.HandleFunc("/v1/events/create", s.handleCreateEvent)
 	mux.HandleFunc("/v1/events/update", s.handleUpdateEvent)
 	mux.HandleFunc("/v1/events/delete", s.handleDeleteEvent)
+	mux.HandleFunc("/v1/auth/login", s.handleLogin)
+	mux.HandleFunc("/v1/auth/2fa", s.handleSubmit2FA)
 
 	// CalDAV endpoint — GNOME Calendar / evolution-data-server compatible.
 	// Clients should point to: http://<host>/caldav/
@@ -86,7 +97,7 @@ func (s *Server) wrapAuth(next http.Handler) http.Handler {
 		// /healthz is always public.
 		// CalDAV paths (/caldav/*) use standard HTTP Basic auth which is handled
 		// by the same Authorize check (Bearer token in the Authorization header).
-		if r.URL.Path != "/healthz" && !s.auth.Authorize(r) {
+		if r.URL.Path != "/healthz" && !isAuthPath(r.URL.Path) && !s.auth.Authorize(r) {
 			// For CalDAV clients that don't send auth on the first request,
 			// advertise WWW-Authenticate so they know to send credentials.
 			if isCalDAVPath(r.URL.Path) {
@@ -202,6 +213,58 @@ func (s *Server) handleMutation(w http.ResponseWriter, r *http.Request, run func
 	writeJSON(w, http.StatusOK, out)
 }
 
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if s.authenticator == nil {
+		writeErr(w, http.StatusNotImplemented, "auth not available for this provider")
+		return
+	}
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	result, err := s.authenticator.Login(r.Context(), req.Username, req.Password)
+	if err != nil {
+		s.log.Error("login failed", "error", err)
+		writeErr(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	s.log.Info("login succeeded", "username", req.Username)
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) handleSubmit2FA(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if s.authenticator == nil {
+		writeErr(w, http.StatusNotImplemented, "auth not available for this provider")
+		return
+	}
+	var req struct {
+		TOTP string `json:"totp"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if err := s.authenticator.Submit2FA(r.Context(), req.TOTP); err != nil {
+		s.log.Error("2fa failed", "error", err)
+		writeErr(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	s.log.Info("2fa succeeded")
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
@@ -215,4 +278,10 @@ func writeErr(w http.ResponseWriter, code int, msg string) {
 // isCalDAVPath returns true if the request path is under /caldav/.
 func isCalDAVPath(path string) bool {
 	return len(path) >= 7 && path[:7] == "/caldav"
+}
+
+// isAuthPath returns true for /v1/auth/* endpoints which must be reachable
+// without a bearer token (you need to log in before you have a token).
+func isAuthPath(path string) bool {
+	return len(path) >= 9 && path[:9] == "/v1/auth/"
 }

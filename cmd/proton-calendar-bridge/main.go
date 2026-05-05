@@ -27,12 +27,13 @@ func run(ctx context.Context) error {
 		return err
 	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level(cfg.LogLevel)}))
-	prov, err := app.BuildProvider(cfg)
+	result, err := app.BuildProviderWithAuth(cfg)
 	if err != nil {
 		return err
 	}
 	tr := tray.New("Proton Calendar Bridge", nil)
-	application := app.New(cfg, prov, tr, logger)
+	application := app.New(cfg, result.Provider, tr, logger)
+	application.SetAuthenticator(result.Authenticator)
 	return application.Run(ctx)
 }
 
